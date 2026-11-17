@@ -24,6 +24,11 @@ local COMPILEE_CONTENTS = [[return "Hello world"]]
 local lutePath = process.execPath()
 local tmpDir = system.tmpdir()
 
+local function writeFile(filePath: path.Path, contents: string)
+	fs.createDirectory(path.dirname(filePath), { makeParents = true })
+	fs.writeStringToFile(filePath, contents)
+end
+
 test.suite("LuteCliCompile", function(suite)
 	suite:case("runCompile", function(check)
 		-- Setup
@@ -47,5 +52,54 @@ test.suite("LuteCliCompile", function(suite)
 		-- -- Cleanup
 		fs.remove(compilerPath)
 		fs.remove(compileePath)
+	end)
+	suite:case("compileProjectOutsideHome", function(check)
+		-- The project sits outside the home folder, like a checkout in
+		-- /workspaces, and requires a package from the Loom store in the home
+		-- folder through a "~/" alias. The package resolves its own alias from
+		-- its .config.luau.
+		local workDir = path.join(tmpDir, "lute-compile-outside-home")
+		if fs.exists(workDir) then
+			fs.removeDirectory(workDir, { recursive = true })
+		end
+
+		local homeDir = path.join(workDir, "home")
+		local packageDir = path.join(homeDir, ".loom", "store", "pkg")
+		writeFile(
+			path.join(packageDir, ".config.luau"),
+			'return { luau = { aliases = { helpers = "./src/helpers" } } }\n'
+		)
+		writeFile(path.join(packageDir, "src", "init.luau"), 'return require("@helpers/greet")\n')
+		writeFile(path.join(packageDir, "src", "helpers", "greet.luau"), 'return "hello from the store"\n')
+
+		local projectDir = path.join(workDir, "project")
+		writeFile(
+			path.join(projectDir, ".config.luau"),
+			'return { luau = { aliases = { pkg = "~/.loom/store/pkg/src" } } }\n'
+		)
+		writeFile(path.join(projectDir, "main.luau"), 'print(require("@pkg"))\n')
+
+		local outputPath = path.join(workDir, if system.win32 then "main.exe" else "main")
+		local env = setmetatable({
+			HOME = path.format(homeDir),
+			USERPROFILE = path.format(homeDir),
+		}, { __index = process.env }) :: any
+
+		local compileResult = process.run({
+			path.format(lutePath),
+			"compile",
+			path.format(path.join(projectDir, "main.luau")),
+			"--output",
+			path.format(outputPath),
+		}, { env = env })
+		check.eq(compileResult.exitcode, 0)
+
+		-- Runs with the real home folder, so "~/" can only resolve inside the bundle.
+		local runResult = process.run({ path.format(outputPath) })
+		check.eq(runResult.stderr, "")
+		check.eq(testutil.normalizeLineEndings(runResult.stdout), "hello from the store\n")
+		check.eq(runResult.exitcode, 0)
+
+		fs.removeDirectory(workDir, { recursive = true })
 	end)
 end)

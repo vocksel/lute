@@ -105,10 +105,16 @@ NavigationStatus BundleVfs::resetToPath(const std::string& path)
     {
         filePath = path.substr(kBundlePrefixPath.size());
     }
-    // Handle "~/path/to/file"
+    // Handle "~/path/to/file". When `lute compile` bundles files from inside
+    // and outside the home folder, the ones from inside it sit under a "~"
+    // folder at the top of the bundle. Otherwise the bundle's root stands in
+    // for the home folder.
     else if (path.size() > 1 && path[0] == '~' && (path[1] == '/' || path[1] == '\\'))
     {
-        filePath = path.substr(2);
+        if (isBundleDirectory(filePathToBytecode, "~"))
+            filePath = "~/" + path.substr(2);
+        else
+            filePath = path.substr(2);
     }
     else
     {

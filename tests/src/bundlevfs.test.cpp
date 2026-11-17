@@ -65,3 +65,18 @@ TEST_CASE("BundleVfs_absolute_disk_path_returns_not_found")
     BundleVfs vfs = makeBundle();
     CHECK(vfs.resetToPath("/Users/anyone/.loom/store/package@v0.2.0/modules") == NavigationStatus::NotFound);
 }
+
+TEST_CASE("BundleVfs_bridges_tilde_alias_to_home_folder_in_bundle")
+{
+    // `lute compile` puts files from the home folder under "~/" when the
+    // project itself is outside the home folder.
+    Luau::DenseHashMap<std::string, std::string> bundleMap;
+    bundleMap["main.luau"] = "bytecode-main";
+    bundleMap["~/.loom/store/package@v0.2.0/modules/init.luau"] = "bytecode-init";
+
+    Luau::DenseHashMap<std::string, std::string> configs;
+    BundleVfs vfs{std::move(configs), std::move(bundleMap)};
+
+    REQUIRE(vfs.resetToPath("~/.loom/store/package@v0.2.0/modules") == NavigationStatus::Success);
+    CHECK(vfs.isModulePresent());
+}

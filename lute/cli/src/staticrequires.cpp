@@ -2,7 +2,7 @@
 
 #include "lute/modulepath.h"
 #include "lute/resolvemodule.h"
-#include "lute/staticrequires.h"
+#include "lute/uvutils.h"
 
 #include "Luau/Ast.h"
 #include "Luau/Config.h"
@@ -10,6 +10,8 @@
 #include "Luau/LuauConfig.h"
 #include "Luau/Parser.h"
 #include "Luau/VecDeque.h"
+
+#include "uv.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -36,9 +38,47 @@ public:
     }
 };
 
+// True when path is a file or folder somewhere below directory.
+static bool isInsideDirectory(const std::string& path, const std::string& directory)
+{
+    if (directory.empty() || path.size() <= directory.size() || path.compare(0, directory.size(), directory) != 0)
+        return false;
+
+    // A directory that already ends in a separator, such as "/", is a prefix of
+    // everything below it.
+    char last = directory.back();
+    if (last == '/' || last == '\\')
+        return true;
+
+    char next = path[directory.size()];
+    return next == '/' || next == '\\';
+}
+
+static std::string stripDirectory(const std::string& path, const std::string& directory)
+{
+    if (!isInsideDirectory(path, directory))
+        return path;
+
+    char last = directory.back();
+    size_t separatorLength = (last == '/' || last == '\\') ? 0 : 1;
+    return path.substr(directory.size() + separatorLength);
+}
+
 StaticRequireTracer::StaticRequireTracer(LuteReporter& reporter)
     : reporter(reporter)
 {
+    auto result = uvutils::getStringFromUv(uv_os_homedir);
+    std::string* home = result.get_if<std::string>();
+    if (home && !home->empty())
+        homeDirectory = normalizePath(*home);
+}
+
+std::string StaticRequireTracer::toBundlePath(const std::string& absolutePath) const
+{
+    if (isInsideDirectory(absolutePath, bundledHomeDirectory))
+        return "~/" + stripDirectory(absolutePath, bundledHomeDirectory);
+
+    return stripDirectory(absolutePath, lowestCommonRoot);
 }
 
 void StaticRequireTracer::trace(const std::string& entryPoint)
@@ -47,6 +87,7 @@ void StaticRequireTracer::trace(const std::string& entryPoint)
     discovered.clear();
     requireGraph.clear();
     luauConfigFiles.clear();
+    bundledHomeDirectory.clear();
 
     if (!isAbsolutePath(entryPoint))
     {
@@ -170,35 +211,37 @@ void StaticRequireTracer::trace(const std::string& entryPoint)
 
     lowestCommonRoot = findLowestCommonRoot(allPaths);
 
-    // Convert absolute .luaurc paths to LCR-relative .luaurc paths and read their content
-    size_t commonRootLen = lowestCommonRoot.empty() ? 0 : lowestCommonRoot.length() + 1; // +1 for the trailing slash
+    // Dependencies installed by `lute pkg install` live in the home folder,
+    // and configs point at them with "~/" aliases. When the project itself is
+    // outside the home folder, such as a checkout in /workspaces or on
+    // another drive, the common root above sits above the home folder (or
+    // there is none), and "~/" no longer matches where those files land in
+    // the bundle. So when the bundle mixes files from inside and outside the
+    // home folder, the ones inside it are bundled under "~/" instead, and the
+    // rest keep paths relative to their own common root.
+    if (homeDirectory)
+    {
+        std::vector<std::string> outsideHome;
+        for (const std::string& path : allPaths)
+        {
+            if (!isInsideDirectory(path, *homeDirectory))
+                outsideHome.push_back(path);
+        }
+
+        if (!outsideHome.empty() && outsideHome.size() < allPaths.size())
+        {
+            bundledHomeDirectory = *homeDirectory;
+            lowestCommonRoot = findLowestCommonRoot(outsideHome);
+        }
+    }
 
     for (const auto& absolutePath : configAbsolutePaths)
     {
-        // Get the directory and filename of the config file
-        std::string absoluteDir = absolutePath;
-        std::string configFileName = absoluteDir;
-        size_t lastSlash = absoluteDir.find_last_of("/\\");
-        if (lastSlash != std::string::npos)
-        {
-            configFileName = absoluteDir.substr(lastSlash + 1);
-            absoluteDir = absoluteDir.substr(0, lastSlash);
-        }
-
-        // Convert to relative path and append the config filename
-        std::string relativeConfig = configFileName;
-        if (commonRootLen > 0 && absoluteDir.length() > commonRootLen)
-        {
-            std::string relativeDir = absoluteDir.substr(commonRootLen);
-            relativeConfig = relativeDir + "/" + configFileName;
-        }
-
-        // Read the .luaurc file content
         std::optional<std::string> content = readFile(absolutePath);
         if (content)
         {
-            // Store using the config file path (e.g., "dir/.luaurc", ".luaurc", or ".config.luau")
-            luauConfigFiles[relativeConfig] = *content;
+            // Store using the config file's bundle path (e.g., "dir/.luaurc", ".luaurc", or "~/dir/.config.luau")
+            luauConfigFiles[toBundlePath(absolutePath)] = *content;
         }
         else
         {
@@ -233,18 +276,8 @@ std::vector<std::pair<std::string, std::string>> StaticRequireTracer::getStaticR
     std::vector<std::pair<std::string, std::string>> pairs;
     pairs.reserve(discovered.size());
 
-    size_t commonRootLen = lowestCommonRoot.empty() ? 0 : lowestCommonRoot.length() + 1; // +1 for the trailing slash
-
     for (const auto& absolutePath : discovered)
-    {
-        std::string bundlePath;
-        if (commonRootLen > 0 && absolutePath.length() > commonRootLen)
-            bundlePath = absolutePath.substr(commonRootLen);
-        else
-            bundlePath = absolutePath;
-
-        pairs.emplace_back(bundlePath, absolutePath);
-    }
+        pairs.emplace_back(toBundlePath(absolutePath), absolutePath);
 
     return pairs;
 }
@@ -258,28 +291,12 @@ void StaticRequireTracer::printRequireGraph() const
 {
     reporter.reportOutput("\nRequire dependency graph:");
 
-    size_t commonRootLen = lowestCommonRoot.empty() ? 0 : lowestCommonRoot.length() + 1;
-
     for (const auto& [file, deps] : requireGraph)
     {
-        // Convert absolute path to bundle path for display
-        std::string displayFile;
-        if (commonRootLen > 0 && file.length() > commonRootLen)
-            displayFile = file.substr(commonRootLen);
-        else
-            displayFile = file;
-
-        reporter.formatOutput("\t%s", displayFile.c_str());
+        reporter.formatOutput("\t%s", toBundlePath(file).c_str());
         for (const auto& dep : deps)
         {
-            // Convert absolute path to bundle path for display
-            std::string displayDep;
-            if (commonRootLen > 0 && dep.length() > commonRootLen)
-                displayDep = dep.substr(commonRootLen);
-            else
-                displayDep = dep;
-
-            reporter.formatOutput("\t\t -> %s", displayDep.c_str());
+            reporter.formatOutput("\t\t -> %s", toBundlePath(dep).c_str());
         }
         if (deps.empty())
         {

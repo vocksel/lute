@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "doctest.h"
+#include "homedirectoryoverride.h"
 #include "lutefixture.h"
 #include "luteprojectroot.h"
 
@@ -186,6 +187,58 @@ TEST_CASE_FIXTURE(LuteFixture, "staticrequiretracer_require_graph")
 
     // Verify the graph can be printed without errors (visual inspection of output)
     tracer.printRequireGraph();
+}
+
+TEST_CASE_FIXTURE(LuteFixture, "staticrequiretracer_bundles_home_files_under_tilde")
+{
+    // The project sits outside the home folder and requires a package from a
+    // Loom store inside it through a "~/" alias, like a checkout in /workspaces.
+    std::string luteProjectRoot = getLuteProjectRootAbsolute();
+    std::string fixtureDir = joinPaths(luteProjectRoot, "tests/src/staticrequires_home");
+    std::string projectDir = joinPaths(fixtureDir, "project");
+    std::string homeDir = joinPaths(fixtureDir, "home");
+    HomeDirectoryOverride home{homeDir};
+
+    StaticRequireTracer tracer{getReporter()};
+    tracer.trace(joinPaths(projectDir, "main.luau"));
+
+    auto pairs = tracer.getStaticRequirePairs();
+    REQUIRE(pairs.size() == 3);
+    CHECK(pairs[0].first == "main.luau");
+
+    std::vector<std::string> bundlePaths;
+    for (const auto& [bundlePath, absolutePath] : pairs)
+        bundlePaths.push_back(bundlePath);
+
+    CHECK(std::find(bundlePaths.begin(), bundlePaths.end(), "~/.loom/store/pkg/src/init.luau") != bundlePaths.end());
+    CHECK(std::find(bundlePaths.begin(), bundlePaths.end(), "~/.loom/store/pkg/src/helpers/greet.luau") != bundlePaths.end());
+
+    // Paths outside the home folder stay relative to the project.
+    CHECK(tracer.getLowestCommonRoot() == projectDir);
+
+    auto luauConfigFiles = tracer.getLuauConfigFiles();
+    REQUIRE(luauConfigFiles.size() == 2);
+    CHECK(luauConfigFiles.find(".config.luau") != nullptr);
+    CHECK(luauConfigFiles.find("~/.loom/store/pkg/.config.luau") != nullptr);
+}
+
+TEST_CASE_FIXTURE(LuteFixture, "staticrequiretracer_keeps_common_root_inside_home")
+{
+    // When everything is inside the home folder, nothing moves under "~/".
+    std::string luteProjectRoot = getLuteProjectRootAbsolute();
+    std::string testDir = joinPaths(luteProjectRoot, "tests/src/staticrequires");
+    HomeDirectoryOverride home{luteProjectRoot};
+
+    StaticRequireTracer tracer{getReporter()};
+    tracer.trace(joinPaths(testDir, "main.luau"));
+
+    auto pairs = tracer.getStaticRequirePairs();
+    REQUIRE(pairs.size() == 7);
+    CHECK(pairs[0].first == "main.luau");
+    CHECK(tracer.getLowestCommonRoot() == testDir);
+
+    for (const auto& [bundlePath, absolutePath] : pairs)
+        CHECK(bundlePath.rfind("~/", 0) != 0);
 }
 
 TEST_CASE("staticrequiretracer_find_lowest_common_root")
